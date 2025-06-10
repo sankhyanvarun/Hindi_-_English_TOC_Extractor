@@ -1,7 +1,7 @@
 streamlit
-pytesseract
-pdf2image
 Pillow
 PyPDF2
 pandas
 numpy
+pytesseract==0.3.10
+pdf2image==1.16.3
