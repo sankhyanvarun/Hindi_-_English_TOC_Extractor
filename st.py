@@ -1,45 +1,103 @@
 import streamlit as st
 import pytesseract
 from pdf2image import convert_from_path
+from PIL import Image, ImageEnhance, ImageFilter
 import os
+import tempfile
+import PyPDF2
+import numpy as np
 
-# Configure paths - CRITICAL FIX
-if os.path.exists('/usr/bin/tesseract'):  # Streamlit Cloud
-    pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
-    poppler_path = '/usr/bin'
-else:  # Local development
-    pytesseract.pytesseract.tesseract_cmd = 'tesseract'
-    poppler_path = None
+# Configure paths
+poppler_path = '/usr/bin' if os.path.exists('/usr/bin') else None
+pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract' if os.path.exists('/usr/bin/tesseract') else 'tesseract'
 
+# Enhancement function
+def enhance_image(img):
+    img = img.convert('L')
+    img = img.filter(ImageFilter.MedianFilter())
+    enhancer = ImageEnhance.Contrast(img)
+    img = enhancer.enhance(2)
+    img = img.point(lambda p: 0 if p < 150 else 255)
+    return img
+
+def extract_text_from_pdf(pdf_path, language='eng'):
+    try:
+        # Convert PDF to images
+        images = convert_from_path(
+            pdf_path,
+            poppler_path=poppler_path,
+            dpi=300,
+            grayscale=True,
+            thread_count=4
+        )
+        
+        if not images:
+            st.error("No pages converted")
+            return ""
+            
+        # Process first page only for demo
+        img = images[0]
+        enhanced_img = enhance_image(img)
+        
+        # OCR with language selection
+        lang = 'hin+eng' if language == 'Hindi' else 'eng'
+        text = pytesseract.image_to_string(
+            enhanced_img,
+            lang=lang,
+            config='--psm 6 --oem 3'
+        )
+        
+        return text
+        
+    except Exception as e:
+        st.error(f"Extraction failed: {str(e)}")
+        return ""
+
+# Streamlit UI
 st.title("PDF TOC Extractor")
 
-# Debug info
+# System check
 st.subheader("System Verification")
-st.write(f"Tesseract path: {pytesseract.pytesseract.tesseract_cmd}")
-st.write(f"Poppler path: {poppler_path}")
-
 try:
-    st.write("Tesseract version:", pytesseract.get_tesseract_version())
-    st.success("Tesseract is working!")
+    st.write(f"Tesseract: {pytesseract.get_tesseract_version()}")
+    st.write(f"Poppler: {'Found' if poppler_path else 'Not found'}")
 except:
-    st.error("Tesseract not found!")
+    st.error("System verification failed")
 
+# Language selection
+language = st.radio("Document Language", ["English", "Hindi"])
+
+# File upload
 uploaded_file = st.file_uploader("Upload PDF", type="pdf")
 
 if uploaded_file:
-    with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
-        tmp_file.write(uploaded_file.getvalue())
-        pdf_path = tmp_file.name
-
     try:
-        images = convert_from_path(pdf_path, poppler_path=poppler_path)
-        st.success(f"Converted {len(images)} pages to images")
+        # Create temporary file with proper permissions
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_file:
+            tmp_file.write(uploaded_file.getvalue())
+            tmp_path = tmp_file.name
         
-        # Simple OCR test
-        text = pytesseract.image_to_string(images[0])
-        st.text_area("OCR Output", text, height=200)
+        text = extract_text_from_pdf(tmp_path, language)
         
+        if text:
+            st.success(f"Extracted {len(text)} characters")
+            with st.expander("View Extracted Text"):
+                st.text(text)
+            
+            # Simple TOC detection
+            if ("contents" in text.lower() or 
+                "table of contents" in text.lower() or 
+                "सूची" in text or 
+                "विषय" in text):
+                st.success("Found TOC indicators in text")
+            else:
+                st.warning("No clear TOC indicators found")
+        else:
+            st.error("No text extracted")
+            
     except Exception as e:
-        st.error(f"Error: {str(e)}")
+        st.error(f"Processing failed: {str(e)}")
     finally:
-        os.unlink(pdf_path)
+        # Clean up temp file
+        if 'tmp_path' in locals() and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
