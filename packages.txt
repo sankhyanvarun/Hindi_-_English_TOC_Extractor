@@ -4,3 +4,4 @@ tesseract-ocr-hin
 poppler-utils
 libsm6
 libxext6
+ffmpeg
