@@ -69,23 +69,38 @@ def enhance_image(img):
         # Convert to OpenCV format for advanced processing
         cv_img = np.array(img)
         
-        # Apply denoising
-        cv_img = cv2.fastNlMeansDenoising(cv_img, None, 10, 7, 21)
+        # Apply denoising - use a stronger denoising for old documents
+        cv_img = cv2.fastNlMeansDenoising(cv_img, None, h=20, templateWindowSize=7, searchWindowSize=21)
         
         # Enhance contrast using CLAHE
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
         cv_img = clahe.apply(cv_img)
+        
+        # Apply sharpening
+        kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+        cv_img = cv2.filter2D(cv_img, -1, kernel)
+        
+        # Apply dilation to thicken text
+        kernel = np.ones((1, 1), np.uint8)
+        cv_img = cv2.dilate(cv_img, kernel, iterations=1)
         
         # Convert back to PIL image
         img = Image.fromarray(cv_img)
+        
+        # Apply PIL-based enhancements
+        enhancer = ImageEnhance.Sharpness(img)
+        img = enhancer.enhance(2.0)
+        
     except Exception:
         # Fallback to basic enhancement if OpenCV fails
-        img = img.filter(ImageFilter.MedianFilter())
+        img = img.filter(ImageFilter.MedianFilter(size=3))
         enhancer = ImageEnhance.Contrast(img)
-        img = enhancer.enhance(2)
+        img = enhancer.enhance(2.5)
+        enhancer = ImageEnhance.Sharpness(img)
+        img = enhancer.enhance(2.0)
     
-    # Apply thresholding
-    img = img.point(lambda p: 0 if p < 160 else 255)
+    # Apply adaptive thresholding
+    img = img.point(lambda p: 0 if p < 180 else 255)
     return img
 
 def truncate_pdf(input_path: str, output_path: str, max_pages: int = 70) -> None:
@@ -108,7 +123,8 @@ def ocr_from_image(image: Image, language: str) -> str:
     """Perform OCR on an image"""
     try:
         enhanced_img = enhance_image(image)
-        config = r'--oem 3 --psm 6'
+        # Use higher quality OCR configuration
+        config = r'--oem 3 --psm 6 -c preserve_interword_spaces=1'
         lang = "hin+eng" if language == "Hindi" else "eng"
         text = pytesseract.image_to_string(enhanced_img, config=config, lang=lang)
         if language == "Hindi":
@@ -127,7 +143,7 @@ def extract_page_text(pdf_path: str, page_num: int, language: str) -> str:
             first_page=page_num + 1,
             last_page=page_num + 1,
             poppler_path=poppler_path,
-            dpi=300,
+            dpi=350,  # Higher DPI for better quality
             grayscale=True,
             thread_count=4
         )
@@ -149,16 +165,39 @@ def extract_text_from_pages(pdf_path: str, page_indices: List[int], language: st
     return accumulated
 
 # ========== IMPROVED TOC EXTRACTION ==========
+def is_valid_roman_numeral(s: str) -> bool:
+    """Check if string is a valid Roman numeral (any length)"""
+    # Basic pattern for Roman numerals (I, V, X, L, C, D, M)
+    roman_pattern = r'^M{0,4}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})$'
+    return bool(re.match(roman_pattern, s.upper()))
+
+def is_valid_page_number(candidate: str) -> bool:
+    """Check if candidate is a valid page number (digit or Roman numeral)"""
+    # Check for digits
+    if candidate.isdigit():
+        return True
+    
+    # Check for Roman numerals
+    if is_valid_roman_numeral(candidate):
+        return True
+    
+    # Check for Roman numerals with common OCR errors
+    if candidate.upper() in {'V', 'X', 'L', 'C', 'D', 'M'}:
+        return True
+    
+    return False
+
 def parse_toc_english(text: str) -> List[Dict[str, str]]:
     """Parse TOC from English text with enhanced handling for complex formats"""
     entries: List[Dict[str, str]] = []
-    skip_terms = ["table of contents", "contents", "page", "toc", "chapter"]
+    skip_terms = ["table of contents", "contents", "page", "toc", "chapter", "page no"]
     current_entry_lines = []  # Collect lines for the current TOC entry
     min_title_length = 4  # Minimum characters to consider as valid title
     current_section = None  # Track current section (like CHAPTER I)
 
     # Enhanced pattern to match page numbers (including Roman numerals)
-    page_num_pattern = r'([ivxlcdmIVXLCDM]+|\d+)[\s.]*$'
+    # Requires separator before page number and minimum distance from start
+    page_num_pattern = r'[\s\.\-\:;]+([ivxlcdmIVXLCDM]+|\d+)[\s.]*$'
 
     # Pattern to match section headers like "CHAPTER I"
     section_pattern = r'^(CHAPTER|PART|SECTION)\s*[IVXLCDM0-9]+$'
@@ -173,6 +212,14 @@ def parse_toc_english(text: str) -> List[Dict[str, str]]:
         ' ;': ';',
         ' -': '-',
         '—': '-',
+        ' .': '.',
+        ' ,': ',',
+        '  ': ' ',
+        '\'': '',  # Remove apostrophes that might cause word breaks
+        '‘': '',   # Remove smart quotes
+        '’': '',
+        '“': '',
+        '”': '',
     }
     
     for old, new in replacements.items():
@@ -200,8 +247,15 @@ def parse_toc_english(text: str) -> List[Dict[str, str]]:
         # Check if this line ends with a sequence of digits or Roman numerals (page number)
         page_match = re.search(page_num_pattern, line)
         if page_match:
-            page_number = page_match.group(1).strip()
-            # The title part is the string without the page number and trailing spaces/punctuation
+            page_str = page_match.group(1).strip()
+            
+            # Validate page number - only allow digits or Roman numerals
+            if not is_valid_page_number(page_str):
+                # Not a valid page number - treat as regular line
+                current_entry_lines.append(line)
+                continue
+            
+            # The title part is the string without the page number and separator
             title_part = line[:page_match.start()].strip()
             
             # Remove trailing dots, dashes, colons, etc.
@@ -227,7 +281,13 @@ def parse_toc_english(text: str) -> List[Dict[str, str]]:
             if len(full_title) < min_title_length or any(term in full_title.lower() for term in skip_terms):
                 continue
                 
-            entries.append({"Title": full_title, "Page": page_number})
+            # Format Roman numerals consistently
+            if page_str.isdigit():
+                page_num = page_str
+            else:
+                page_num = page_str.upper()  # Standardize to uppercase Roman numerals
+                
+            entries.append({"Title": full_title, "Page": page_num})
         else:
             # Line doesn't end with page number → buffer it
             # But check if it might be a section header
@@ -324,11 +384,7 @@ def main():
                         st.session_state.raw_text = extracted_text
                         
                         # Extract TOC based on language
-                        if st.session_state.language == "Hindi":
-                            # For Hindi, we'll use the same improved parser
-                            toc_entries = parse_toc_english(extracted_text) or []
-                        else:
-                            toc_entries = parse_toc_english(extracted_text) or []
+                        toc_entries = parse_toc_english(extracted_text) or []
                     else:
                         # Process PDF file
                         with tempfile.TemporaryDirectory() as temp_dir:
@@ -353,11 +409,7 @@ def main():
                             start_page_index = st.session_state.start_page - 1  # Convert to 0-based index
                             
                             # Find TOC pages
-                            if st.session_state.language == "Hindi":
-                                # For Hindi, we'll use the same improved parser
-                                toc_indices = list(range(start_page_index, start_page_index + st.session_state.max_pages))
-                            else:
-                                toc_indices = list(range(start_page_index, start_page_index + st.session_state.max_pages))
+                            toc_indices = list(range(start_page_index, start_page_index + st.session_state.max_pages))
                             
                             # Extract text from identified pages
                             extracted_text = extract_text_from_pages(
@@ -367,7 +419,7 @@ def main():
                             )
                             st.session_state.raw_text = extracted_text
                             
-                            # Use the improved parser for both languages
+                            # Use the improved parser
                             toc_entries = parse_toc_english(extracted_text) or []
                     
                     # Process results
