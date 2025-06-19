@@ -36,6 +36,8 @@ if 'start_page' not in st.session_state:
     st.session_state.start_page = 1
 if 'file_type' not in st.session_state:
     st.session_state.file_type = None
+if 'uploaded_file_name' not in st.session_state:
+    st.session_state.uploaded_file_name = ""
 
 # Configure paths for cloud compatibility
 poppler_path = '/usr/bin' if os.path.exists('/usr/bin') else None
@@ -69,38 +71,23 @@ def enhance_image(img):
         # Convert to OpenCV format for advanced processing
         cv_img = np.array(img)
         
-        # Apply denoising - use a stronger denoising for old documents
-        cv_img = cv2.fastNlMeansDenoising(cv_img, None, h=20, templateWindowSize=7, searchWindowSize=21)
+        # Apply denoising
+        cv_img = cv2.fastNlMeansDenoising(cv_img, None, 10, 7, 21)
         
         # Enhance contrast using CLAHE
-        clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         cv_img = clahe.apply(cv_img)
-        
-        # Apply sharpening
-        kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
-        cv_img = cv2.filter2D(cv_img, -1, kernel)
-        
-        # Apply dilation to thicken text
-        kernel = np.ones((1, 1), np.uint8)
-        cv_img = cv2.dilate(cv_img, kernel, iterations=1)
         
         # Convert back to PIL image
         img = Image.fromarray(cv_img)
-        
-        # Apply PIL-based enhancements
-        enhancer = ImageEnhance.Sharpness(img)
-        img = enhancer.enhance(2.0)
-        
     except Exception:
         # Fallback to basic enhancement if OpenCV fails
-        img = img.filter(ImageFilter.MedianFilter(size=3))
+        img = img.filter(ImageFilter.MedianFilter())
         enhancer = ImageEnhance.Contrast(img)
-        img = enhancer.enhance(2.5)
-        enhancer = ImageEnhance.Sharpness(img)
-        img = enhancer.enhance(2.0)
+        img = enhancer.enhance(2)
     
-    # Apply adaptive thresholding
-    img = img.point(lambda p: 0 if p < 180 else 255)
+    # Apply thresholding
+    img = img.point(lambda p: 0 if p < 160 else 255)
     return img
 
 def truncate_pdf(input_path: str, output_path: str, max_pages: int = 70) -> None:
@@ -123,8 +110,7 @@ def ocr_from_image(image: Image, language: str) -> str:
     """Perform OCR on an image"""
     try:
         enhanced_img = enhance_image(image)
-        # Use higher quality OCR configuration
-        config = r'--oem 3 --psm 6 -c preserve_interword_spaces=1'
+        config = r'--oem 3 --psm 6'
         lang = "hin+eng" if language == "Hindi" else "eng"
         text = pytesseract.image_to_string(enhanced_img, config=config, lang=lang)
         if language == "Hindi":
@@ -143,7 +129,7 @@ def extract_page_text(pdf_path: str, page_num: int, language: str) -> str:
             first_page=page_num + 1,
             last_page=page_num + 1,
             poppler_path=poppler_path,
-            dpi=350,  # Higher DPI for better quality
+            dpi=300,
             grayscale=True,
             thread_count=4
         )
@@ -165,28 +151,6 @@ def extract_text_from_pages(pdf_path: str, page_indices: List[int], language: st
     return accumulated
 
 # ========== IMPROVED TOC EXTRACTION ==========
-def is_valid_roman_numeral(s: str) -> bool:
-    """Check if string is a valid Roman numeral (any length)"""
-    # Basic pattern for Roman numerals (I, V, X, L, C, D, M)
-    roman_pattern = r'^M{0,4}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})$'
-    return bool(re.match(roman_pattern, s.upper()))
-
-def is_valid_page_number(candidate: str) -> bool:
-    """Check if candidate is a valid page number (digit or Roman numeral)"""
-    # Check for digits
-    if candidate.isdigit():
-        return True
-    
-    # Check for Roman numerals
-    if is_valid_roman_numeral(candidate):
-        return True
-    
-    # Check for Roman numerals with common OCR errors
-    if candidate.upper() in {'V', 'X', 'L', 'C', 'D', 'M'}:
-        return True
-    
-    return False
-
 def parse_toc_english(text: str) -> List[Dict[str, str]]:
     """Parse TOC from English text with enhanced handling for complex formats"""
     entries: List[Dict[str, str]] = []
@@ -194,10 +158,11 @@ def parse_toc_english(text: str) -> List[Dict[str, str]]:
     current_entry_lines = []  # Collect lines for the current TOC entry
     min_title_length = 4  # Minimum characters to consider as valid title
     current_section = None  # Track current section (like CHAPTER I)
+    min_page_num_length = 2  # Minimum characters for a valid page number
 
     # Enhanced pattern to match page numbers (including Roman numerals)
-    # Requires separator before page number and minimum distance from start
-    page_num_pattern = r'[\s\.\-\:;]+([ivxlcdmIVXLCDM]+|\d+)[\s.]*$'
+    # Now requires separator and minimum length for page numbers
+    page_num_pattern = r'[\s\.\-\:;]+([ivxlcdmIVXLCDM]{1,5}|\d{1,4})[\s.]*$'
 
     # Pattern to match section headers like "CHAPTER I"
     section_pattern = r'^(CHAPTER|PART|SECTION)\s*[IVXLCDM0-9]+$'
@@ -215,17 +180,18 @@ def parse_toc_english(text: str) -> List[Dict[str, str]]:
         ' .': '.',
         ' ,': ',',
         '  ': ' ',
-        '\'': '',  # Remove apostrophes that might cause word breaks
-        '‘': '',   # Remove smart quotes
-        '’': '',
-        '“': '',
-        '”': '',
+        '↲': ' ',   # Handle enter symbols
+        '↵': ' ',   # Handle enter symbols
+        '⏎': ' ',   # Handle enter symbols
     }
     
     for old, new in replacements.items():
         text = text.replace(old, new)
     
-    for raw_line in text.split('\n'):
+    # Split text into lines, handling various newline representations
+    lines = re.split(r'[\n\r]+', text)
+    
+    for raw_line in lines:
         line = raw_line.strip()
         if not line:
             continue
@@ -236,6 +202,12 @@ def parse_toc_english(text: str) -> List[Dict[str, str]]:
         
         # Check if this is a section header
         if re.match(section_pattern, line, re.IGNORECASE):
+            # If we have accumulated content, create an entry before starting new section
+            if current_entry_lines:
+                full_title = " ".join(current_entry_lines).strip()
+                if len(full_title) >= min_title_length and not any(term in full_title.lower() for term in skip_terms):
+                    entries.append({"Title": full_title, "Page": "?"})
+                current_entry_lines = []
             current_section = line
             continue
         
@@ -249,12 +221,11 @@ def parse_toc_english(text: str) -> List[Dict[str, str]]:
         if page_match:
             page_str = page_match.group(1).strip()
             
-            # Validate page number - only allow digits or Roman numerals
-            if not is_valid_page_number(page_str):
-                # Not a valid page number - treat as regular line
+            # Skip very short "page numbers" that are likely word fragments
+            if len(page_str) < min_page_num_length:
                 current_entry_lines.append(line)
                 continue
-            
+                
             # The title part is the string without the page number and separator
             title_part = line[:page_match.start()].strip()
             
@@ -265,12 +236,12 @@ def parse_toc_english(text: str) -> List[Dict[str, str]]:
             full_title = ""
             if current_section:
                 full_title = current_section + " - "
-                current_section = None
+                current_section = None  # Reset after use
                 
             # Prepend any accumulated lines
             if current_entry_lines:
                 full_title += " ".join(current_entry_lines) + " "
-                current_entry_lines = []
+                current_entry_lines = []  # Reset after use
                 
             full_title += title_part
             
@@ -293,7 +264,12 @@ def parse_toc_english(text: str) -> List[Dict[str, str]]:
             # But check if it might be a section header
             if re.match(r'^[A-Z\s\-]+$', line):
                 # Likely a section header or chapter title
+                if current_section:  # If we already have a section, add to entries
+                    full_title = " ".join(current_entry_lines).strip() if current_entry_lines else current_section
+                    if len(full_title) >= min_title_length and not any(term in full_title.lower() for term in skip_terms):
+                        entries.append({"Title": full_title, "Page": "?"})
                 current_section = line
+                current_entry_lines = []
             else:
                 current_entry_lines.append(line)
             
@@ -303,7 +279,13 @@ def parse_toc_english(text: str) -> List[Dict[str, str]]:
         if len(full_title) >= min_title_length and not any(term in full_title.lower() for term in skip_terms):
             entries.append({"Title": full_title, "Page": "?"})
             
-    return entries
+    # Filter out invalid entries with single-character page numbers
+    filtered_entries = [
+        entry for entry in entries
+        if len(entry["Page"]) >= min_page_num_length or entry["Page"] == "?"
+    ]
+    
+    return filtered_entries
 
 # ========== UI AND MAIN APP ==========
 def main():
@@ -361,6 +343,9 @@ def main():
     )
     
     if uploaded_file is not None:
+        # Store file name for CSV download
+        st.session_state.uploaded_file_name = uploaded_file.name
+        
         # Determine file type
         file_extension = uploaded_file.name.split('.')[-1].lower()
         is_image = file_extension in SUPPORTED_IMAGE_FORMATS
@@ -537,13 +522,18 @@ def main():
             st.info(f"Total characters: {len(st.session_state.raw_text)}")
     
     # Download section
-    if not st.session_state.toc_df.empty:
+    if not st.session_state.toc_df.empty and st.session_state.uploaded_file_name:
         st.subheader("Download Final TOC")
+        
+        # Create CSV file name based on uploaded file name
+        base_name = os.path.splitext(st.session_state.uploaded_file_name)[0]
+        csv_file_name = f"{base_name}_table_of_contents.csv"
+        
         csv = st.session_state.toc_df.to_csv(index=False).encode('utf-8-sig')
         st.download_button(
             label="Download TOC as CSV",
             data=csv,
-            file_name="table_of_contents.csv",
+            file_name=csv_file_name,
             mime="text/csv"
         )
 
