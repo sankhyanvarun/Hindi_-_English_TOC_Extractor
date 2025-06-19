@@ -5,3 +5,4 @@ poppler-utils
 libsm6
 libxext6
 ffmpeg
+libopencv-dev
